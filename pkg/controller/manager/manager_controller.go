@@ -17,7 +17,6 @@ package manager
 import (
 	"context"
 	"fmt"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -35,7 +34,6 @@ import (
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
-	octrl "github.com/tigera/operator/pkg/controller"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/compliance"
 	"github.com/tigera/operator/pkg/controller/options"
@@ -90,7 +88,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	// Make a helper for determining which namespaces to use based on tenancy mode.
-	helper := octrl.NewNamespaceHelper(opts.MultiTenant, render.ManagerNamespace, "")
+	helper := utils.NewNamespaceHelper(opts.MultiTenant, render.ManagerNamespace, "")
 
 	if err := utils.AddSecretsWatch(managerController, render.VoltronLinseedTLS, helper.InstallNamespace()); err != nil {
 		return err
@@ -111,7 +109,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 	// Watch for other operator.tigera.io resources.
 	if err = managerController.Watch(&source.Kind{Type: &operatorv1.Installation{}}, eventHandler); err != nil {
-		return fmt.Errorf("manager-controller failed to watch Network resource: %w", err)
+		return fmt.Errorf("manager-controller failed to watch Installation resource: %w", err)
 	}
 	if err = managerController.Watch(&source.Kind{Type: &operatorv1.APIServer{}}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch APIServer resource: %w", err)
@@ -238,7 +236,7 @@ func GetManager(ctx context.Context, cli client.Client, mt bool, ns string) (*op
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	// Perform any common preparation that needs to be done for single-tenant and multi-tenant scenarios.
-	helper := octrl.NewNamespaceHelper(r.multiTenant, render.ManagerNamespace, request.Namespace)
+	helper := utils.NewNamespaceHelper(r.multiTenant, render.ManagerNamespace, request.Namespace)
 	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace())
 	logc.Info("Reconciling Manager")
 
@@ -296,14 +294,14 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	// Validate that the tier watch is ready before querying the tier to ensure we utilize the cache.
 	if !r.tierWatchReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tier watch to be established", nil, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created", err, logc)
-			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, logc)
 			return reconcile.Result{}, err
@@ -312,7 +310,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 	if !r.licenseAPIReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for LicenseKeyAPI to be ready", nil, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// TODO: Do we need a license per-tenant in the management cluster?
@@ -320,10 +318,10 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "License not found", err, logc)
-			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		}
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying license", err, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// Fetch the Installation instance. We need this for a few reasons.
@@ -504,6 +502,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 	var linseedVoltronServerCert certificatemanagement.KeyPairInterface
 	var tunnelServerCert certificatemanagement.KeyPairInterface
+	var tunnelSecretPassthrough render.Component
 
 	if managementCluster != nil {
 		preDefaultPatchFrom := client.MergeFrom(managementCluster.DeepCopy())
@@ -533,36 +532,33 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 		// Query the tunnel server certificate used by Voltron to serve mTLS connections from managed clusters.
 		tunnelSecretName := managementCluster.Spec.TLS.SecretName
-		if r.multiTenant {
-			// For multi-tenant clusters, ensure that we have a CA that can be used to sign the tunnel server cert within this tenant's namespace.
-			// This certificate will also be presented by Voltron to prove its identity to managed clusters.
-			tunnelCASecret, err := utils.GetSecret(ctx, r.client, tunnelSecretName, helper.TruthNamespace())
-			if err != nil {
-				r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to fetch the tunnel secret", err, logc)
-				return reconcile.Result{}, err
-			}
-			if tunnelCASecret == nil {
-				// TODO: SAN should include the tenant ID, and Guardian should set the TLS hostname to the value with the tenant ID.
-				tunnelCASecret, err = certificatemanagement.CreateSelfSignedSecret(tunnelSecretName, helper.TruthNamespace(), "tigera-voltron", []string{"voltron"})
-				if err != nil {
-					r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the tunnel secret", err, logc)
-					return reconcile.Result{}, err
-				}
-			}
+		// For multi-tenant clusters, ensure that we have a CA that can be used to sign the tunnel server cert within this tenant's namespace.
+		// For single-tenant cluster, ensure that we have a CA that can be used to sign the tunnel server cert in operator namespace.
+		// This certificate will also be presented by Voltron to prove its identity to managed clusters.
+		tunnelCASecret, err := utils.GetSecret(ctx, r.client, tunnelSecretName, helper.TruthNamespace())
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to fetch the tunnel secret", err, logc)
+			return reconcile.Result{}, err
+		}
 
-			// We use the CA as the server cert.
-			tunnelServerCert = certificatemanagement.NewKeyPair(tunnelCASecret, nil, "")
-		} else {
-			// For single-tenant clusters, query the secret directly. This will have already been created by the apiserver controller.
-			tunnelServerCert, err = certificateManager.GetKeyPair(r.client, tunnelSecretName, helper.TruthNamespace(), []string{"voltron"})
-			if tunnelServerCert == nil {
-				r.status.SetDegraded(operatorv1.ResourceNotReady, fmt.Sprintf("Waiting for secret %s/%s to be available", helper.TruthNamespace(), tunnelSecretName), nil, logc)
+		// Single tenant MCM clusters will use "voltron" as a server name to establish mTLS connection
+		serverName := "voltron"
+		if r.multiTenant {
+			// Multi-tenant MCM clusters will use the tenat ID as a server name to establish mTLS connection
+			serverName = tenant.Spec.ID
+		}
+
+		if tunnelCASecret == nil {
+			tunnelCASecret, err = certificatemanagement.CreateSelfSignedSecret(tunnelSecretName, helper.TruthNamespace(), "tigera-voltron", []string{serverName})
+			if err != nil {
+				r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the tunnel secret", err, logc)
 				return reconcile.Result{}, err
-			} else if err != nil {
-				r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("Error fetching TLS secret %s/%s ", helper.TruthNamespace(), tunnelSecretName), err, logc)
-				return reconcile.Result{}, nil
 			}
 		}
+
+		// We use the CA as the server cert.
+		tunnelServerCert = certificatemanagement.NewKeyPair(tunnelCASecret, nil, "")
+		tunnelSecretPassthrough = render.NewPassthrough(tunnelCASecret)
 	}
 
 	keyValidatorConfig, err := utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.clusterDomain)
@@ -662,6 +658,11 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 			TrustedBundle: bundleMaker,
 		}),
 	}
+
+	if tunnelSecretPassthrough != nil {
+		components = append(components, tunnelSecretPassthrough)
+	}
+
 	for _, component := range components {
 		if err := componentHandler.CreateOrUpdateOrDelete(ctx, component, r.status); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, logc)

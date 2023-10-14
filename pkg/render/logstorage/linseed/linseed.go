@@ -181,9 +181,17 @@ func (l *linseed) linseedClusterRole() *rbacv1.ClusterRole {
 		},
 		{
 			// Need to be able to list managed clusters
+			// TODO: Move to namespaced role in multi-tenant.
 			APIGroups: []string{"projectcalico.org"},
 			Resources: []string{"managedclusters"},
 			Verbs:     []string{"list", "watch"},
+		},
+		// These permissions are necessary to allow the management cluster to monitor secrets that we want to propagate
+		// through to the managed cluster for identity verification such as the Voltron Linseed public certificate
+		{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"get", "list", "watch"},
 		},
 	}
 
@@ -293,17 +301,14 @@ func (l *linseed) linseedDeployment() *appsv1.Deployment {
 
 	if l.cfg.ManagementCluster {
 		envVars = append(envVars,
-			corev1.EnvVar{Name: "TOKEN_CONTROLLER_ENABLED", Value: "true"},
-			corev1.EnvVar{Name: "LINSEED_TOKEN_KEY", Value: l.cfg.TokenKeyPair.VolumeMountKeyFilePath()},
 			corev1.EnvVar{Name: "MANAGEMENT_OPERATOR_NS", Value: common.OperatorNamespace()},
 		)
-		volumes = append(volumes, l.cfg.TokenKeyPair.Volume())
-		volumeMounts = append(volumeMounts, l.cfg.TokenKeyPair.VolumeMount(l.SupportedOSType()))
 	}
 
 	if l.cfg.Tenant != nil {
-		// If a tenant was provided, set the expected tenant ID.
+		// If a tenant was provided, set the expected tenant ID and enable the shared index backend.
 		envVars = append(envVars, corev1.EnvVar{Name: "LINSEED_EXPECTED_TENANT_ID", Value: l.cfg.Tenant.Spec.ID})
+		envVars = append(envVars, corev1.EnvVar{Name: "BACKEND", Value: "elastic-single-index"})
 	}
 
 	var initContainers []corev1.Container

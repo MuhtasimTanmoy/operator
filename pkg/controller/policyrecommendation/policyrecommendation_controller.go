@@ -17,11 +17,8 @@ package policyrecommendation
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/tigera/operator/pkg/controller/tenancy"
-
-	octrl "github.com/tigera/operator/pkg/controller"
 
 	"k8s.io/apimachinery/pkg/types"
 
@@ -97,20 +94,13 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: installNS},
 	})
 
-	// Watch for changes to primary resource PolicyRecommendation
 	err = policyRecController.Watch(&source.Kind{Type: &operatorv1.PolicyRecommendation{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
 
-	// Watch for changes to primary resource PolicyRecommendationScope
-	err = policyRecController.Watch(&source.Kind{Type: &v3.PolicyRecommendationScope{}}, &handler.EnqueueRequestForObject{})
-	if err != nil {
-		return fmt.Errorf("policy-recommendation-controller failed to watch policy recommendation scope resource: %w", err)
-	}
-
-	if err = utils.AddNetworkWatch(policyRecController); err != nil {
-		return fmt.Errorf("policy-recommendation-controller failed to watch Network resource: %w", err)
+	if err = utils.AddInstallationWatch(policyRecController); err != nil {
+		return fmt.Errorf("policy-recommendation-controller failed to watch Installation resource: %w", err)
 	}
 
 	if err = imageset.AddImageSetWatch(policyRecController); err != nil {
@@ -136,20 +126,14 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		}
 	}
 
-	if err = utils.AddConfigMapWatch(policyRecController, relasticsearch.ClusterConfigConfigMapName, common.OperatorNamespace(), &handler.EnqueueRequestForObject{}); err != nil {
-		return fmt.Errorf("policy-recommendation-controller failed to watch the ConfigMap resource: %w", err)
-	}
-
-	// Watch for changes to primary resource ManagementCluster
 	err = policyRecController.Watch(&source.Kind{Type: &operatorv1.ManagementCluster{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
-		return fmt.Errorf("policy-recommendation-controller failed to watch primary resource: %w", err)
+		return fmt.Errorf("policy-recommendation-controller failed to watch ManagementCluster resource: %w", err)
 	}
 
-	// Watch for changes to primary resource ManagementClusterConnection
 	err = policyRecController.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
-		return fmt.Errorf("policy-recommendation-controller failed to watch primary resource: %w", err)
+		return fmt.Errorf("policy-recommendation-controller failed to watch ManagementClusterConnection resource: %w", err)
 	}
 
 	// Watch for changes to TigeraStatus
@@ -226,7 +210,7 @@ func GetPolicyRecommendation(ctx context.Context, cli client.Client, mt bool, ns
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
-	helper := octrl.NewNamespaceHelper(r.multiTenant, render.PolicyRecommendationNamespace, request.Namespace)
+	helper := utils.NewNamespaceHelper(r.multiTenant, render.PolicyRecommendationNamespace, request.Namespace)
 	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace())
 	logc.Info("Reconciling PolicyRecommendation")
 
@@ -236,7 +220,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	// Check if this is a tenant-scoped request.
-	_, _, err := utils.GetTenant(ctx, r.multiTenant, r.client, request.Namespace)
+	tenant, _, err := utils.GetTenant(ctx, r.multiTenant, r.client, request.Namespace)
 	if errors.IsNotFound(err) {
 		logc.Info("No Tenant in this Namespace, skip")
 		return reconcile.Result{}, nil
@@ -274,20 +258,20 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	// Validate that the tier watch is ready before querying the tier to ensure we utilize the cache.
 	if !r.tierWatchReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tier watch to be established", err, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// Validate that the policy recommendation scope watch is ready before querying the tier to ensure we utilize the cache.
 	if !r.policyRecScopeWatchReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for PolicyRecommendationScope watch to be established", err, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created", err, logc)
-			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
 			log.Error(err, "Error querying allow-tigera tier")
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, logc)
@@ -297,17 +281,17 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 
 	if !r.licenseAPIReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for LicenseKeyAPI to be ready", nil, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	license, err := utils.FetchLicenseKey(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "License not found", err, logc)
-			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		}
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying license", err, logc)
-		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// Query for the installation object.
@@ -324,16 +308,6 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to retrieve pull secrets", err, logc)
-		return reconcile.Result{}, err
-	}
-
-	esClusterConfig, err := utils.GetElasticsearchClusterConfig(ctx, r.client)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Elasticsearch cluster configuration is not available, waiting for it to become available", err, logc)
-			return reconcile.Result{}, nil
-		}
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get the elasticsearch cluster configuration", err, logc)
 		return reconcile.Result{}, err
 	}
 
@@ -357,33 +331,18 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 		return reconcile.Result{}, err
 	}
 
-	secretsToWatch := []string{
-		render.ElasticsearchPolicyRecommendationUserSecret,
-	}
-	esSecrets, err := utils.ElasticsearchSecrets(ctx, secretsToWatch, r.client)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Elasticsearch secrets are not available yet, waiting until they become available", err, logc)
-			return reconcile.Result{}, nil
-		}
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get Elasticsearch credentials", err, logc)
-		return reconcile.Result{}, err
-	}
-
 	// Create a component handler to manage the rendered component.
 	handler := utils.NewComponentHandler(log, r.client, r.scheme, policyRecommendation)
 
 	logc.V(3).Info("rendering components")
 	policyRecommendationCfg := &render.PolicyRecommendationConfiguration{
-		ClusterDomain:   r.clusterDomain,
-		ESClusterConfig: esClusterConfig,
-		ESSecrets:       esSecrets,
-		Installation:    installation,
-		ManagedCluster:  isManagedCluster,
-		PullSecrets:     pullSecrets,
-		Openshift:       r.provider == operatorv1.ProviderOpenShift,
-		UsePSP:          r.usePSP,
-		Namespace:       helper.InstallNamespace(),
+		ClusterDomain:  r.clusterDomain,
+		Installation:   installation,
+		ManagedCluster: isManagedCluster,
+		PullSecrets:    pullSecrets,
+		Openshift:      r.provider == operatorv1.ProviderOpenShift,
+		UsePSP:         r.usePSP,
+		Namespace:      helper.InstallNamespace(),
 	}
 
 	// Render the desired objects from the CRD and create or update them.
@@ -399,7 +358,11 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	if !isManagedCluster {
-		certificateManager, err := certificatemanager.Create(r.client, installation, r.clusterDomain, helper.TruthNamespace())
+		opts := []certificatemanager.Option{
+			certificatemanager.WithLogger(logc),
+			certificatemanager.WithTenant(tenant),
+		}
+		certificateManager, err := certificatemanager.Create(r.client, installation, r.clusterDomain, helper.TruthNamespace(), opts...)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, logc)
 			return reconcile.Result{}, err
@@ -471,7 +434,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	if !r.status.IsAvailable() {
 		// Schedule a kick to check again in the near future. Hopefully by then
 		// things will be available.
-		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
 	// Everything is available - update the CRD status.

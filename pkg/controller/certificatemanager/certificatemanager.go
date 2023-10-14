@@ -72,7 +72,9 @@ type certificateManager struct {
 // CertificateManager can sign new certificates and has methods to retrieve existing KeyPairs and Certificates. If a user
 // brings their own secrets, CertificateManager will preserve and return them.
 type CertificateManager interface {
-	// GetKeyPair returns an existing KeyPair. If the KeyPair is not found, nil is returned.
+	// GetKeyPair returns an existing KeyPair. In normal operation, if the KeyPair is not found, nil is returned.
+	// However, when certificate management is enabled keypairs are not written to the cluster. In this case, the keypair returned by this function
+	// is an implementation of KeyPairInterface using the provided dnsNames.
 	GetKeyPair(cli client.Client, secretName, secretNamespace string, dnsNames []string) (certificatemanagement.KeyPairInterface, error)
 	// GetOrCreateKeyPair returns a KeyPair. If one exists, some checks are performed. Otherwise, a new KeyPair is created.
 	GetOrCreateKeyPair(cli client.Client, secretName, secretNamespace string, dnsNames []string) (certificatemanagement.KeyPairInterface, error)
@@ -181,7 +183,9 @@ func Create(cli client.Client, installation *operatorv1.InstallationSpec, cluste
 			len(caSecret.Data[corev1.TLSCertKey]) == 0 {
 
 			if !cm.allowCACreation {
-				return nil, fmt.Errorf("CA secret %s/%s does not exist yet", ns, caSecretName)
+				// Most controllers should NOT allow CA creation. For single-tenant, this is handled at cluster startup by the secret controller.
+				// For multi-tenant clusters, each tenant has its own CA that is created by the tenant controller.
+				return nil, fmt.Errorf("CA secret %s/%s does not exist yet and is not allowed for this call", ns, caSecretName)
 			}
 			// No existing CA data - we need to generate a new one.
 			cm.log.Info("Generating a new CA", "namespace", ns)
@@ -346,7 +350,7 @@ func (cm *certificateManager) getKeyPair(cli client.Client, secretName, secretNa
 		}
 		return nil, nil, err
 	}
-	keyPEM, certPEM := GetKeyCertPEM(secret)
+	keyPEM, certPEM := certificatemanagement.GetKeyCertPEM(secret)
 	if !readCertOnly {
 		if len(keyPEM) == 0 {
 			return nil, nil, errNoPrivateKeyPEM(secretName, secretNamespace)
@@ -448,36 +452,6 @@ func (cm *certificateManager) GetKeyPair(cli client.Client, secretName, secretNa
 // CertificateManagement returns the CertificateManagement object or nil if it is not configured.
 func (cm *certificateManager) CertificateManagement() *operatorv1.CertificateManagement {
 	return cm.keyPair.CertificateManagement
-}
-
-func GetKeyCertPEM(secret *corev1.Secret) ([]byte, []byte) {
-	const (
-		legacySecretCertName  = "cert" // Formerly known as certificatemanagement.ManagerSecretCertName
-		legacySecretKeyName   = "key"  // Formerly known as certificatemanagement.ManagerSecretKeyName
-		legacySecretKeyName2  = "apiserver.key"
-		legacySecretCertName2 = "apiserver.crt"
-		legacySecretKeyName3  = "key.key"             // Formerly used for Felix and Typha.
-		legacySecretCertName3 = "cert.crt"            // Formerly used for Felix and Typha.
-		legacySecretKeyName4  = "managed-cluster.key" // Used for tunnel secrets
-		legacySecretCertName4 = "managed-cluster.crt"
-		legacySecretKeyName5  = "management-cluster.key"
-		legacySecretCertName5 = "management-cluster.crt"
-	)
-	data := secret.Data
-	for keyField, certField := range map[string]string{
-		corev1.TLSPrivateKeyKey: corev1.TLSCertKey,
-		legacySecretKeyName:     legacySecretCertName,
-		legacySecretKeyName2:    legacySecretCertName2,
-		legacySecretKeyName3:    legacySecretCertName3,
-		legacySecretKeyName4:    legacySecretCertName4,
-		legacySecretKeyName5:    legacySecretCertName5,
-	} {
-		key, cert := data[keyField], data[certField]
-		if len(cert) > 0 {
-			return key, cert
-		}
-	}
-	return nil, nil
 }
 
 // certificateManagementKeyPair returns a KeyPair for to be used when certificate management is used to provide a key pair to a pod.

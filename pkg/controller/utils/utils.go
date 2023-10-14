@@ -62,6 +62,13 @@ var (
 	DefaultInstanceKey     = client.ObjectKey{Name: "default"}
 	DefaultTSEEInstanceKey = client.ObjectKey{Name: "tigera-secure"}
 	OverlayInstanceKey     = client.ObjectKey{Name: "overlay"}
+
+	PeriodicReconcileTime = 5 * time.Minute
+
+	// StandardRetry is the amount of time to wait beofre retrying a request in
+	// most scenarios. Retries should be used sparingly, and only in extraordinary
+	// circumstances. Use this as a default when retries are needed.
+	StandardRetry = 30 * time.Second
 )
 
 // ContextLoggerForResource provides a logger instance with context set for the provided object.
@@ -82,8 +89,7 @@ func IgnoreObject(obj runtime.Object) bool {
 	return false
 }
 
-// TODO: Deprecate and delete these functions.
-func AddNetworkWatch(c controller.Controller) error {
+func AddInstallationWatch(c controller.Controller) error {
 	return c.Watch(&source.Kind{Type: &operatorv1.Installation{}}, &handler.EnqueueRequestForObject{})
 }
 
@@ -145,11 +151,8 @@ func AddDeploymentWatch(c controller.Controller, name, namespace string) error {
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func AddPeriodicReconcile(c controller.Controller, period time.Duration) error {
-	return c.Watch(
-		&source.Channel{Source: createPeriodicReconcileChannel(period)},
-		&handler.EnqueueRequestForObject{},
-	)
+func AddPeriodicReconcile(c controller.Controller, period time.Duration, handler handler.EventHandler) error {
+	return c.Watch(&source.Channel{Source: createPeriodicReconcileChannel(period)}, handler)
 }
 
 // AddSecretWatchWithLabel adds a secret watch for secrets with the given label in the given namespace.
@@ -219,7 +222,7 @@ func WaitToAddTierWatch(tierName string, controller controller.Controller, c kub
 
 // AddNamespacedWatch creates a watch on the given object. If a name and namespace are provided, then it will
 // use predicates to only return matching objects. If they are not, then all events of the provided kind
-// will be generated.
+// will be generated. Updates that do not modify the object's generation (e.g., status and metadata) will be ignored.
 func AddNamespacedWatch(c controller.Controller, obj client.Object, h handler.EventHandler, metaMatches ...MetaMatch) error {
 	objMeta := obj.(metav1.ObjectMetaAccessor).GetObjectMeta()
 	pred := createPredicateForObject(objMeta)
@@ -328,10 +331,8 @@ func ValidateCertPair(client client.Client, namespace, certPairSecretName, keyNa
 	return secret, nil
 }
 
-// GetK8sServiceEndPoint reads the kubernetes-service-endpoint configmap and pushes
-// KUBERNETES_SERVICE_HOST, KUBERNETES_SERVICE_PORT to calico-node daemonset, typha
-// apiserver deployments
-func GetK8sServiceEndPoint(client client.Client) error {
+// GetK8sServiceEndPoint returns the kubernetes-service-endpoint configmap
+func GetK8sServiceEndPoint(client client.Client) (*corev1.ConfigMap, error) {
 	cmName := render.K8sSvcEndpointConfigMapName
 	cm := &corev1.ConfigMap{}
 	cmNamespacedName := types.NamespacedName{
@@ -339,9 +340,20 @@ func GetK8sServiceEndPoint(client client.Client) error {
 		Namespace: common.OperatorNamespace(),
 	}
 	if err := client.Get(context.Background(), cmNamespacedName, cm); err != nil {
-		// If the configmap is unavailable, do not return error
+		return nil, err
+	}
+	return cm, nil
+}
+
+// PopulateK8sServiceEndPoint reads the kubernetes-service-endpoint configmap and pushes
+// KUBERNETES_SERVICE_HOST, KUBERNETES_SERVICE_PORT to calico-node daemonset, typha
+// apiserver deployments
+func PopulateK8sServiceEndPoint(client client.Client) error {
+	cm, err := GetK8sServiceEndPoint(client)
+	if err != nil {
 		if !kerrors.IsNotFound(err) {
-			return fmt.Errorf("Failed to read ConfigMap %q: %s", cmName, err)
+			// If the configmap is unavailable, do not return an error
+			return fmt.Errorf("Failed to read ConfigMap %q: %s", render.K8sSvcEndpointConfigMapName, err)
 		}
 	} else {
 		k8sapi.Endpoint.Host = cm.Data["KUBERNETES_SERVICE_HOST"]
@@ -635,13 +647,21 @@ func createPredicateForObject(objMeta metav1.Object) predicate.Predicate {
 			return e.Object.GetNamespace() == objMeta.GetNamespace() || objMeta.GetNamespace() == ""
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
+			generationChanged := e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+
 			if objMeta.GetName() == "" && objMeta.GetNamespace() == "" {
-				return true
+				// No name or namespace match was specified. Match everything, assuming the generation has changed.
+				return generationChanged
 			}
+
 			if objMeta.GetName() != "" && e.ObjectNew.GetName() != objMeta.GetName() {
+				// A name match was specified, and the object doesn't match it.
 				return false
 			}
-			return e.ObjectNew.GetNamespace() == objMeta.GetNamespace() || objMeta.GetNamespace() == ""
+			// A name match was specified and the name matches, or this is just a namespace match.
+			// Assuming the generation has changed, return a match if the namespaces also match,
+			// or if no namespace was given to match against.
+			return generationChanged && (e.ObjectNew.GetNamespace() == objMeta.GetNamespace() || objMeta.GetNamespace() == "")
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			if objMeta.GetName() == "" && objMeta.GetNamespace() == "" {
@@ -727,4 +747,35 @@ func AddNodeLocalDNSWatch(c controller.Controller) error {
 		},
 	}
 	return c.Watch(&source.Kind{Type: &appsv1.DaemonSet{}}, &handler.EnqueueRequestForObject{}, createPredicateForObject(ds))
+}
+
+func GetDNSServiceIPs(ctx context.Context, client client.Client, provider operatorv1.Provider) ([]string, error) {
+	// Discover the DNS Service's cluster IP address:
+	// Default kubernetes dns service is named "kube-dns", but RKE2 is using a different name for the default
+	// dns service i.e. "rke2-coredns-rke2-coredns".
+	dnsServiceName := "kube-dns"
+	if provider == operatorv1.ProviderRKE2 {
+		dnsServiceName = "rke2-coredns-rke2-coredns"
+	}
+
+	kubeDNSService := &corev1.Service{}
+
+	err := client.Get(ctx, types.NamespacedName{Name: dnsServiceName, Namespace: "kube-system"}, kubeDNSService)
+	if err != nil {
+		return nil, err
+	}
+
+	return kubeDNSService.Spec.ClusterIPs, nil
+}
+
+// GetDNSServiceName returns the name and namespace for the DNS service based on the given provider.
+// This is "kube-dns" for most providers, but varies on OpenShift and RKE2.
+func GetDNSServiceName(provider operatorv1.Provider) types.NamespacedName {
+	kubeDNSServiceName := types.NamespacedName{Name: "kube-dns", Namespace: "kube-system"}
+	if provider == operatorv1.ProviderOpenShift {
+		kubeDNSServiceName = types.NamespacedName{Name: "dns-default", Namespace: "openshift-dns"}
+	} else if provider == operatorv1.ProviderRKE2 {
+		kubeDNSServiceName = types.NamespacedName{Name: "rke2-coredns-rke2-coredns", Namespace: "kube-system"}
+	}
+	return kubeDNSServiceName
 }
