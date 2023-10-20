@@ -53,7 +53,7 @@ var (
 	}
 
 	ComponentCalicoNode = component{
-		Version:  "master",
+		Version:  "latest",
 		Image:    "calico/node",
 		Registry: "",
 	}
@@ -89,7 +89,7 @@ var (
 	}
 
 	ComponentCalicoAPIServer = component{
-		Version:  "master",
+		Version:  "master-amd64",
 		Image:    "calico/apiserver",
 		Registry: "",
 	}

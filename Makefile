@@ -268,13 +268,13 @@ endif
 BINDIR?=build/init/bin
 $(BINDIR)/kubectl:
 	mkdir -p $(BINDIR)
-	curl -L https://storage.googleapis.com/kubernetes-release/release/v1.25.6/bin/linux/$(ARCH)/kubectl -o $@
+	curl -L https://storage.googleapis.com/kubernetes-release/release/v1.25.6/bin/$(BUILDOS)/$(ARCH)/kubectl -o $@
 	chmod +x $@
 
 kubectl: $(BINDIR)/kubectl
 
 $(BINDIR)/kind:
-	$(CONTAINERIZED) $(CALICO_BUILD) sh -c "GOBIN=/go/src/$(PACKAGE_NAME)/$(BINDIR) go install sigs.k8s.io/kind"
+	sh -c "GOBIN=/go/src/$(PACKAGE_NAME)/$(BINDIR) go install sigs.k8s.io/kind"
 
 clean:
 	rm -rf build/_output
