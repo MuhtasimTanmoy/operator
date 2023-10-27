@@ -53,7 +53,7 @@ var (
 	}
 
 	ComponentCalicoNode = component{
-		Version:  "master",
+		Version:  "latest",
 		Image:    "calico/node",
 		Registry: "",
 	}
