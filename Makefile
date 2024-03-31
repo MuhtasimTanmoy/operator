@@ -43,6 +43,7 @@ ARCHES ?= amd64 arm64 ppc64le s390x
 # we need to keep track of them separately
 BUILDARCH ?= $(shell uname -m)
 BUILDOS ?= $(shell uname -s | tr A-Z a-z)
+VERSION = master
 
 # canonicalized names for host architecture
 ifeq ($(BUILDARCH),aarch64)
@@ -254,13 +255,17 @@ endif
 BINDIR?=build/init/bin
 $(BINDIR)/kubectl:
 	mkdir -p $(BINDIR)
-	curl -L https://storage.googleapis.com/kubernetes-release/release/v1.25.6/bin/linux/$(ARCH)/kubectl -o $@
+	curl -L https://storage.googleapis.com/kubernetes-release/release/v1.25.6/bin/$(BUILDOS)/$(ARCH)/kubectl -o $@
 	chmod +x $@
 
 kubectl: $(BINDIR)/kubectl
 
 $(BINDIR)/kind:
+ifeq ($(BUILDOS), darwin)
+	sh -c "GOBIN=/go/src/$(PACKAGE_NAME)/$(BINDIR) go install sigs.k8s.io/kind"
+else
 	$(CONTAINERIZED) $(CALICO_BUILD) sh -c "GOBIN=/go/src/$(PACKAGE_NAME)/$(BINDIR) go install sigs.k8s.io/kind"
+endif
 
 clean:
 	rm -rf build/_output
@@ -614,6 +619,16 @@ gen-versions-enterprise: $(BINDIR)/gen-versions update-enterprise-crds
 
 gen-versions-common: $(BINDIR)/gen-versions
 	$(BINDIR)/gen-versions -common-versions=$(COMMON_VERSIONS) > pkg/components/common.go
+
+# sets calico version based on OS
+# https://stackoverflow.com/questions/4247068/sed-command-with-i-option-failing-on-mac-but-works-on-linux/4247319#4247319
+set-calico-version:
+ifeq ($(BUILDOS), darwin)
+	sed -i '' -e 's/version: .*/version: $(VERSION)/' config/calico_versions.yml
+else
+	sed -i -e 's/version: .*/version: $(VERSION)/' config/calico_versions.yml
+endif
+	make gen-versions-calico
 
 $(BINDIR)/gen-versions: $(shell find ./hack/gen-versions -type f)
 	mkdir -p $(BINDIR)
